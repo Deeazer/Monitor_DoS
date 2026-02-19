@@ -3,9 +3,11 @@ import socket
 import time
 import csv
 from datetime import datetime
+import paramiko
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
                              QLineEdit, QLabel, QSpinBox, QCheckBox, QTextEdit, QFileDialog, QMessageBox,
-                             QToolBar, QAction, QSizePolicy, QStyle, QTabWidget, QSplitter)
+                             QToolBar, QAction, QSizePolicy, QStyle, QTabWidget, QSplitter, QTableWidget,
+                             QTableWidgetItem, QHeaderView)
 from PyQt5.QtCore import QTimer, Qt, QSize, QSizeF
 from PyQt5.QtGui import QIcon, QPixmap, QPainter
 from PyQt5.QtPrintSupport import QPrinter, QPrintDialog
@@ -22,6 +24,7 @@ class PortMonitorApp(QMainWindow):
         self.port_status = {}
         self.monitoring = False
         self.start_time = None
+        self.ssh_clients = {}
         
         self.init_ui()
         
@@ -134,6 +137,75 @@ class PortMonitorApp(QMainWindow):
         self.availability_graph.showGrid(x=True, y=True)
         availability_layout.addWidget(self.availability_graph)
         self.tabs.addTab(availability_tab, "Доступность")
+
+        # SSH monitoring tab
+        ssh_tab = QWidget()
+        ssh_layout = QVBoxLayout(ssh_tab)
+
+        ssh_control_layout = QHBoxLayout()
+
+        server_layout = QVBoxLayout()
+        server_layout.addWidget(QLabel("Linux серверы (user@host:port, через запятую):"))
+        self.ssh_servers_input = QLineEdit("root@127.0.0.1:22")
+        server_layout.addWidget(self.ssh_servers_input)
+        ssh_control_layout.addLayout(server_layout)
+
+        password_layout = QVBoxLayout()
+        password_layout.addWidget(QLabel("SSH пароль:"))
+        self.ssh_password_input = QLineEdit()
+        self.ssh_password_input.setEchoMode(QLineEdit.Password)
+        password_layout.addWidget(self.ssh_password_input)
+        ssh_control_layout.addLayout(password_layout)
+
+        key_layout = QVBoxLayout()
+        key_layout.addWidget(QLabel("SSH ключ (опционально):"))
+        key_input_layout = QHBoxLayout()
+        self.ssh_key_input = QLineEdit()
+        self.ssh_key_input.setPlaceholderText("Путь до private key")
+        key_input_layout.addWidget(self.ssh_key_input)
+        self.ssh_key_button = QPushButton("...")
+        self.ssh_key_button.clicked.connect(self.select_ssh_key)
+        key_input_layout.addWidget(self.ssh_key_button)
+        key_layout.addLayout(key_input_layout)
+        ssh_control_layout.addLayout(key_layout)
+
+        ssh_interval_layout = QVBoxLayout()
+        ssh_interval_layout.addWidget(QLabel("Интервал SSH (сек):"))
+        self.ssh_interval_input = QSpinBox()
+        self.ssh_interval_input.setRange(5, 300)
+        self.ssh_interval_input.setValue(15)
+        ssh_interval_layout.addWidget(self.ssh_interval_input)
+        ssh_control_layout.addLayout(ssh_interval_layout)
+
+        self.ssh_connect_button = QPushButton("Подключиться")
+        self.ssh_connect_button.clicked.connect(self.start_ssh_monitoring)
+        ssh_control_layout.addWidget(self.ssh_connect_button)
+
+        self.ssh_disconnect_button = QPushButton("Отключиться")
+        self.ssh_disconnect_button.clicked.connect(self.stop_ssh_monitoring)
+        self.ssh_disconnect_button.setEnabled(False)
+        ssh_control_layout.addWidget(self.ssh_disconnect_button)
+
+        self.ssh_refresh_button = QPushButton("Обновить")
+        self.ssh_refresh_button.clicked.connect(self.check_ssh_servers)
+        self.ssh_refresh_button.setEnabled(False)
+        ssh_control_layout.addWidget(self.ssh_refresh_button)
+
+        ssh_layout.addLayout(ssh_control_layout)
+
+        self.ssh_status_label = QLabel("SSH мониторинг не запущен")
+        ssh_layout.addWidget(self.ssh_status_label)
+
+        self.ssh_table = QTableWidget(0, 8)
+        self.ssh_table.setHorizontalHeaderLabels([
+            "Сервер", "Подключение", "Состояние", "Uptime",
+            "Load Avg", "RAM (%)", "Disk / (%)", "Последняя проверка"
+        ])
+        self.ssh_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ssh_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        ssh_layout.addWidget(self.ssh_table)
+
+        self.tabs.addTab(ssh_tab, "SSH Linux")
         
         # Log
         self.log = QTextEdit()
@@ -146,6 +218,8 @@ class PortMonitorApp(QMainWindow):
         # Timer for periodic checks
         self.timer = QTimer()
         self.timer.timeout.connect(self.check_ports)
+        self.ssh_timer = QTimer()
+        self.ssh_timer.timeout.connect(self.check_ssh_servers)
         
     def toggle_monitoring(self):
         if not self.monitoring:
@@ -273,18 +347,144 @@ class PortMonitorApp(QMainWindow):
                 return result == 0
         except Exception as e:
             return False
+
+    def select_ssh_key(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Выберите SSH ключ", "", "Все файлы (*)")
+        if file_path:
+            self.ssh_key_input.setText(file_path)
+
+    def parse_ssh_servers(self):
+        servers = []
+        raw_servers = [item.strip() for item in self.ssh_servers_input.text().split(',') if item.strip()]
+        for item in raw_servers:
+            try:
+                if '@' not in item:
+                    raise ValueError("Не указан пользователь")
+                user, host_port = item.split('@', 1)
+                host, port = (host_port.split(':', 1) + ['22'])[:2]
+                servers.append({'name': item, 'user': user, 'host': host, 'port': int(port)})
+            except Exception:
+                self.log_message(f"Некорректный формат сервера: {item}. Ожидается user@host:port")
+        return servers
+
+    def start_ssh_monitoring(self):
+        servers = self.parse_ssh_servers()
+        if not servers:
+            QMessageBox.warning(self, "Ошибка", "Не удалось распознать список SSH серверов")
+            return
+
+        self.stop_ssh_monitoring(log=False)
+        self.ssh_table.setRowCount(len(servers))
+        self.ssh_clients = {}
+
+        key_filename = self.ssh_key_input.text().strip() or None
+        password = self.ssh_password_input.text() or None
+
+        for row, server in enumerate(servers):
+            self.ssh_table.setItem(row, 0, QTableWidgetItem(server['name']))
+            self.ssh_table.setItem(row, 1, QTableWidgetItem("Подключение..."))
+            self.ssh_table.setItem(row, 2, QTableWidgetItem("Неизвестно"))
+
+            try:
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.connect(
+                    hostname=server['host'],
+                    port=server['port'],
+                    username=server['user'],
+                    password=password,
+                    key_filename=key_filename,
+                    timeout=5,
+                    banner_timeout=5,
+                    auth_timeout=5
+                )
+                self.ssh_clients[server['name']] = client
+                self.ssh_table.setItem(row, 1, QTableWidgetItem("Подключено"))
+                self.log_message(f"SSH подключение установлено: {server['name']}")
+            except Exception as e:
+                self.ssh_table.setItem(row, 1, QTableWidgetItem("Ошибка"))
+                self.ssh_table.setItem(row, 2, QTableWidgetItem("Offline"))
+                self.ssh_table.setItem(row, 7, QTableWidgetItem(datetime.now().strftime("%H:%M:%S")))
+                self.log_message(f"Ошибка SSH подключения к {server['name']}: {str(e)}")
+
+        if not self.ssh_clients:
+            QMessageBox.warning(self, "SSH", "Не удалось подключиться ни к одному серверу")
+            self.ssh_status_label.setText("SSH мониторинг не запущен")
+            return
+
+        self.ssh_connect_button.setEnabled(False)
+        self.ssh_disconnect_button.setEnabled(True)
+        self.ssh_refresh_button.setEnabled(True)
+        self.ssh_timer.start(self.ssh_interval_input.value() * 1000)
+        self.ssh_status_label.setText(f"SSH мониторинг активен: {len(self.ssh_clients)} сервер(ов)")
+        self.check_ssh_servers()
+
+    def stop_ssh_monitoring(self, log=True):
+        self.ssh_timer.stop()
+        for client in self.ssh_clients.values():
+            try:
+                client.close()
+            except Exception:
+                pass
+        self.ssh_clients = {}
+
+        self.ssh_connect_button.setEnabled(True)
+        self.ssh_disconnect_button.setEnabled(False)
+        self.ssh_refresh_button.setEnabled(False)
+        self.ssh_status_label.setText("SSH мониторинг не запущен")
+        if log:
+            self.log_message("SSH мониторинг остановлен")
+
+    def read_ssh_resources(self, client):
+        command = (
+            "bash -lc \""
+            "uptime -p 2>/dev/null || echo unknown;"
+            "cat /proc/loadavg | awk '{print $1}' 2>/dev/null || echo n/a;"
+            "free | awk '/Mem:/ {printf \\\"%.1f\\\", $3/$2*100}' 2>/dev/null || echo n/a;"
+            "echo;"
+            "df / | awk 'NR==2 {gsub(/%/,\\\"\\\",$5); print $5}' 2>/dev/null || echo n/a"
+            "\""
+        )
+        stdin, stdout, stderr = client.exec_command(command, timeout=6)
+        lines = stdout.read().decode(errors='ignore').strip().splitlines()
+        if len(lines) < 4:
+            raise RuntimeError(stderr.read().decode(errors='ignore').strip() or "Недостаточно данных")
+        return {
+            'uptime': lines[0],
+            'load': lines[1],
+            'ram': lines[2],
+            'disk': lines[3]
+        }
+
+    def check_ssh_servers(self):
+        if not self.ssh_clients:
+            return
+
+        for row in range(self.ssh_table.rowCount()):
+            server_item = self.ssh_table.item(row, 0)
+            if not server_item:
+                continue
+
+            server_name = server_item.text()
+            client = self.ssh_clients.get(server_name)
+            if client is None:
+                continue
+
+            try:
+                data = self.read_ssh_resources(client)
+                self.ssh_table.setItem(row, 1, QTableWidgetItem("Подключено"))
+                self.ssh_table.setItem(row, 2, QTableWidgetItem("Online"))
+                self.ssh_table.setItem(row, 3, QTableWidgetItem(data['uptime']))
+                self.ssh_table.setItem(row, 4, QTableWidgetItem(data['load']))
+                self.ssh_table.setItem(row, 5, QTableWidgetItem(data['ram']))
+                self.ssh_table.setItem(row, 6, QTableWidgetItem(data['disk']))
+                self.ssh_table.setItem(row, 7, QTableWidgetItem(datetime.now().strftime("%H:%M:%S")))
+            except Exception as e:
+                self.ssh_table.setItem(row, 1, QTableWidgetItem("Ошибка"))
+                self.ssh_table.setItem(row, 2, QTableWidgetItem("Offline"))
+                self.ssh_table.setItem(row, 7, QTableWidgetItem(datetime.now().strftime("%H:%M:%S")))
+                self.log_message(f"Ошибка чтения ресурсов {server_name}: {str(e)}")
             
-        def init_port_status(self, port):
-            """Initialize the status dictionary for a port."""
-            if port not in self.port_status:
-                self.port_status[port] = {
-                    'response_times': [],
-                    'availability': [],
-                    'plot': {}  # Initialize plot dictionary
-                }
-        # Ensure plot is always a dictionary
-        if 'plot' not in self.port_status[port] or not isinstance(self.port_status[port]['plot'], dict):
-            self.port_status[port]['plot'] = {}
     
     def log_message(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
